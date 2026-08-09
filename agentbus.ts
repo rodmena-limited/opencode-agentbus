@@ -34,6 +34,37 @@ type HookResult = { code: number; stdout: string; stderr: string }
  * exception is the gate, which converts failure into a DENY at its call site,
  * because a gate that cannot reach its rules must not permit.
  */
+/** Strip JSONC comments and trailing commas so JSON.parse accepts the file.
+ *
+ * STRING-AWARE ON PURPOSE. opencode configs are full of URLs — bob's has
+ * `https://runflow.rodmena.app/mcp` — and a naive `//` strip would amputate every
+ * one of them into `https:`, producing a config that parses cleanly and is
+ * silently wrong. That is worse than failing to parse, because a wrong endpoint
+ * looks like a working install that cannot reach the bus.
+ */
+function stripJsonc(text: string): string {
+  let out = ""
+  let inStr = false, esc = false, line = false, block = false
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i], n = text[i + 1]
+    if (line) { if (c === "\n") { line = false; out += c } continue }
+    if (block) { if (c === "*" && n === "/") { block = false; i++ } continue }
+    if (inStr) {
+      out += c
+      if (esc) esc = false
+      else if (c === "\\") esc = true
+      else if (c === '"') inStr = false
+      continue
+    }
+    if (c === '"') { inStr = true; out += c; continue }
+    if (c === "/" && n === "/") { line = true; i++; continue }
+    if (c === "/" && n === "*") { block = true; i++; continue }
+    out += c
+  }
+  // Trailing commas are legal in JSONC and fatal to JSON.parse.
+  return out.replace(/,(\s*[}\]])/g, "$1")
+}
+
 async function run(
   $: PluginInput["$"], bin: string, args: string[], stdin?: string,
   env?: Record<string, string>,
@@ -149,8 +180,21 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   async function resolveKey(): Promise<string> {
     if (process.env.AGENTBUS_API_KEY) return process.env.AGENTBUS_API_KEY
     try {
-      const cfg = `${process.env.HOME}/.config/opencode/opencode.json`
-      const d = JSON.parse(await Bun.file(cfg).text()) as {
+      // .jsonc FIRST, and this was a real defect rather than tidiness.
+      //
+      // We read only opencode.json. bob's host has only opencode.jsonc — WITH
+      // comments — so the plugin loaded, found no credential, and could never
+      // authenticate. It was invisible here because this host happens to have
+      // the .json spelling, which is the definition of works-on-my-machine: the
+      // one environment we tested was the one where it could not fail.
+      const cfg = await (async () => {
+        for (const name of ["opencode.jsonc", "opencode.json"]) {
+          const p = `${process.env.HOME}/.config/opencode/${name}`
+          if (await Bun.file(p).exists()) return p
+        }
+        return `${process.env.HOME}/.config/opencode/opencode.json`
+      })()
+      const d = JSON.parse(stripJsonc(await Bun.file(cfg).text())) as {
         mcp?: Record<string, { headers?: Record<string, string> }>
       }
       const auth = d.mcp?.agentbus?.headers?.Authorization ?? ""
