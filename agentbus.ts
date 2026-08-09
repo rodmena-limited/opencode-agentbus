@@ -179,6 +179,30 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
    */
   async function resolveKey(): Promise<string> {
     if (process.env.AGENTBUS_API_KEY) return process.env.AGENTBUS_API_KEY
+
+    // THIRD SOURCE, found by david: the host's bound-key store. `agentbus
+    // sibling add` writes ~/.config/agentbus/keys/<agent>.env with a key bound
+    // to that agent alone, and the shell hooks already source it — but this
+    // plugin never looked, so a host with a perfectly good credential on disk
+    // still reported "no credential".
+    //
+    // ONLY when AGENTBUS_AGENT names the identity. If several key files exist,
+    // picking one would be guessing which agent this session is, and SPECS/0029
+    // is explicit that identity is declared and never inferred: a wrong guess
+    // makes this session act as, and read the mail of, somebody else. Staying
+    // unidentified is the safe failure.
+    const named = process.env.AGENTBUS_AGENT
+    if (named) {
+      try {
+        const p = `${process.env.HOME}/.config/agentbus/keys/${named}.env`
+        const text = await Bun.file(p).text()
+        const m = text.match(/^\s*(?:export\s+)?AGENTBUS_API_KEY\s*=\s*["']?([^"'\s]+)/m)
+        if (m) {
+          await mark(`credential from the bound-key store for ${named}`)
+          return m[1]
+        }
+      } catch { /* no key file for this agent — fall through */ }
+    }
     try {
       // .jsonc FIRST, and this was a real defect rather than tidiness.
       //
