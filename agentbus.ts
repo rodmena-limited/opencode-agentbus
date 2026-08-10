@@ -376,6 +376,28 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   const STREAM_KEEPALIVE_MS = 20_000
   const STREAM_IDLE_DEADLINE_MS = 3 * STREAM_KEEPALIVE_MS
 
+  // A KEEPALIVE IS BYTES, SO THE IDLE DEADLINE CAN NEVER FIRE ON A LIVE SERVER.
+  //
+  // bob reproduced this against a real opencode session, control proven first: a
+  // stub sending ONLY `: keepalive` frames never tripped STREAM_IDLE_DEADLINE_MS,
+  // because every keepalive settles reader.read() and resets the deadline. The
+  // deadline therefore catches a link that goes SILENT and catches nothing at all
+  // on a server that is keepaliving — which is every healthy server. If a push is
+  // ever missed to this stream, this client has no second way to find out and the
+  // agent is deaf until the process restarts.
+  //
+  // Identical to the Python defect fixed in 0.4.39 (STREAM_RECONCILE_SECONDS).
+  // It shipped there and not here: same defect class, one client fixed, the other
+  // not. That asymmetry is the finding, and it is why parity is checked now.
+  //
+  // The reconcile is a CHEAP inbox check, NOT a periodic reconnect. An idle agent
+  // must not reconnect every minute — that trades a silent failure for permanent
+  // load, which is the reconnect-storm failure three lines up wearing a different
+  // hat. Only when the server says something exists after our last id do we drop
+  // the stream, and the reconnect replays it through the delivery path that is
+  // already proven.
+  const STREAM_RECONCILE_MS = 60_000
+
   /** Reject if `p` has not settled within the idle deadline. */
   function withIdleDeadline<T>(p: Promise<T>, onExpire: () => void): Promise<T> {
     return new Promise<T>((resolve, reject) => {
@@ -411,6 +433,30 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
     // goes quiet exactly like a working one with an empty inbox.
     void (async () => {
       let lastId = ""
+
+      /**
+       * Did the server accept mail this stream never pushed us?
+       *
+       * One inbox GET for a single row after `lastId`. It deliberately does NOT
+       * deliver anything: waking from two code paths is how a message arrives
+       * twice, and the reconnect below already replays correctly from
+       * Last-Event-ID. This answers one question and takes no action.
+       *
+       * Any failure answers NO. Reconnecting on a network blip would turn a
+       * transient error into a reconnect loop, and a genuinely dead link is still
+       * covered by the idle deadline.
+       */
+      async function streamMissedMail(cursor: string): Promise<boolean> {
+        try {
+          const q = `cursor=${encodeURIComponent(cursor || "0")}&limit=1`
+          const r = await fetch(`${base}/v1/inbox?${q}`, {
+            headers: { Authorization: `Bearer ${key}`, "X-AgentBus-Agent": agentName },
+          })
+          if (!r.ok) return false
+          const body = await r.json() as { messages?: unknown[] }
+          return Array.isArray(body.messages) && body.messages.length > 0
+        } catch { return false }
+      }
       let backoff = 1000
       for (;;) {
         if (ac.signal.aborted) return
@@ -437,6 +483,9 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
           const reader = res.body.getReader()
           const decoder = new TextDecoder()
           let buf = ""
+          // Per connection: a fresh stream has just replayed its backlog, so the
+          // clock starts now instead of firing a reconcile immediately.
+          let lastReconcile = Date.now()
           for (;;) {
             // IDLE DEADLINE — the only way this client can notice a link that
             // died WITHOUT a close.
@@ -459,6 +508,22 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
               void reader.cancel().catch(() => {})
             })
             if (done) break
+
+            // THE RECONCILE TICK. Runs on ANY traffic, keepalives included, which
+            // is the whole point: keepalives are exactly what stops the idle
+            // deadline from ever firing, so they are the only clock this client
+            // reliably has.
+            if (Date.now() - lastReconcile >= STREAM_RECONCILE_MS) {
+              lastReconcile = Date.now()
+              if (await streamMissedMail(lastId)) {
+                await mark(
+                  "stream: reconcile found mail the stream never pushed — " +
+                  "reconnecting to replay it")
+                void reader.cancel().catch(() => {})
+                break
+              }
+            }
+
             buf += decoder.decode(value, { stream: true })
             // SSE frames are separated by a blank line.
             let cut: number
