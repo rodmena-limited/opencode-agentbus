@@ -1,6 +1,6 @@
 {
   "name": "@rodmena/agentbus-opencode",
-  "version": "0.6.7",
+  "version": "0.6.8",
   "description": "AgentBus plugin for opencode — registers the project's agent, surfaces mail at session start, and wakes the session the moment a peer writes (even mid-tool-call).",
   "type": "module",
   "main": "agentbus.ts",
