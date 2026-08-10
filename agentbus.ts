@@ -674,13 +674,20 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
      * THE GATE, verdict form. FAILS CLOSED: anything other than an explicit
      * allow denies. A gate that permits when it cannot reach its rules is worse
      * than no gate, because it reports as protection.
+     *
+     * OPT-IN GATE (same rule as tool.execute.before): no credential resolved for
+     * THIS session means this session is not AgentBus, and must not be failed
+     * closed by host-global state. Only a session with its own credential is
+     * consulted.
      */
     "permission.ask": async (permission, output) => {
+      const env = hookEnv()
+      if (!env) return
       const payload = JSON.stringify({
         tool_name: (permission as { type?: string }).type ?? "unknown",
         tool_input: permission,
       })
-      const res = await run($, HOOK_BIN, ["pre-tool-use"], payload, hookEnv())
+      const res = await run($, HOOK_BIN, ["pre-tool-use"], payload, env)
       let allow = false
       try {
         const parsed = JSON.parse(res.stdout) as {
@@ -695,10 +702,22 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
      * THE GATE, enforcement form. Fires for EVERY tool call, including ones
      * opencode never asks about — the population `permission.ask` cannot see.
      * Enforces by throwing, because this hook's output carries only `args`.
+     *
+     * THE OPT-IN GATE. A session is AgentBus-gated ONLY when it has its own
+     * credential (`sessionKey`). The credential cannot come from the inherited
+     * process env: opencode sessions in ANY project on a machine that also
+     * runs AgentBus would inherit `AGENTBUS_AGENT`/`AGENTBUS_API_KEY` from the
+     * shell, and every such session — including unrelated ones, e.g. in
+     * another app entirely — would be failed-closed by `pre-tool-use`. That
+     * is how a prism session that never opted into AgentBus got every tool
+     * blocked (2026-08-10): the gate derived "is this an AgentBus session"
+     * from host-global state instead of this session's own credential.
      */
     "tool.execute.before": async (info, _output) => {
+      const env = hookEnv()
+      if (!env) return  // no credential for THIS session: not AgentBus, ungated
       const payload = JSON.stringify({ tool_name: info.tool, tool_input: _output })
-      const res = await run($, HOOK_BIN, ["pre-tool-use"], payload, hookEnv())
+      const res = await run($, HOOK_BIN, ["pre-tool-use"], payload, env)
       let decision = ""
       let reason = ""
       try {
