@@ -104,8 +104,19 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   // wake rests on an unobserved premise, which is the exact defect that has
   // bitten this platform repeatedly. Written unconditionally, not behind an env
   // var, so "did it load" is always answerable after the fact.
+  // ONE PLACE DECIDES WHERE CONFIG LIVES, AND IT HONOURS AGENTBUS_CONFIG_DIR.
+  //
+  // This was hardcoded to $HOME/.config/agentbus in two places while the Python
+  // client and the monitor both honour AGENTBUS_CONFIG_DIR. bob reported it as a
+  // testability defect and he is right that it is not cosmetic: with the env var
+  // ignored, a probe cannot give this plugin an isolated config, so every test
+  // either touches the real credential store or cannot exercise the credential
+  // path at all. A component that cannot be pointed at a fixture is a component
+  // whose failures are only discoverable in production.
+  const configDir = process.env.AGENTBUS_CONFIG_DIR
+    || `${process.env.HOME}/.config/agentbus`
   const markerPath = process.env.AGENTBUS_PLUGIN_MARKER
-    || `${process.env.HOME}/.config/agentbus/opencode-plugin.marker`
+    || `${configDir}/opencode-plugin.marker`
   async function mark(line: string): Promise<void> {
     try {
       const prev = await Bun.file(markerPath).text().catch(() => "")
@@ -194,7 +205,7 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
     const named = process.env.AGENTBUS_AGENT
     if (named) {
       try {
-        const p = `${process.env.HOME}/.config/agentbus/keys/${named}.env`
+        const p = `${configDir}/keys/${named}.env`
         const text = await Bun.file(p).text()
         const m = text.match(/^\s*(?:export\s+)?AGENTBUS_API_KEY\s*=\s*["']?([^"'\s]+)/m)
         if (m) {
@@ -230,7 +241,13 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   /** Ask the credential who it is. NEVER guess, and never fall back. */
   async function resolveAgent(key: string): Promise<string> {
     if (!key) {
-      await mark("no credential: no AGENTBUS_API_KEY and no bearer token in opencode.json mcp.agentbus")
+      // Name BOTH files, because the lookup reads both. Saying only opencode.json
+      // sent bob looking in a file his host does not have — his config is .jsonc,
+      // which is why the .jsonc-first lookup exists twenty lines up. A diagnostic
+      // that names the wrong file is worse than none: it spends the reader's time
+      // proving the message wrong before they can start on the actual problem.
+      await mark("no credential: no AGENTBUS_API_KEY, and no bearer token in " +
+        "mcp.agentbus in opencode.jsonc or opencode.json")
       return ""
     }
     const res = await runWithKey(["--json", "whoami"], key)
