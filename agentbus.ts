@@ -215,26 +215,47 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       } catch { /* no key file for this agent — fall through */ }
     }
     try {
-      // .jsonc FIRST, and this was a real defect rather than tidiness.
+      // PROJECT-LEVEL FIRST, THEN GLOBAL — the order is the point, and it is
+      // what #83's "no-bypass leg" rests on.
       //
-      // We read only opencode.json. bob's host has only opencode.jsonc — WITH
-      // comments — so the plugin loaded, found no credential, and could never
-      // authenticate. It was invisible here because this host happens to have
-      // the .json spelling, which is the definition of works-on-my-machine: the
-      // one environment we tested was the one where it could not fail.
-      const cfg = await (async () => {
-        for (const name of ["opencode.jsonc", "opencode.json"]) {
-          const p = `${process.env.HOME}/.config/opencode/${name}`
-          if (await Bun.file(p).exists()) return p
+      // `agentbus setup opencode` writes a PROJECT-scoped opencode.json with the
+      // agent's own bound key in mcp.agentbus. A project that declares its own
+      // identity must be served by that identity — NOT by whatever the global
+      // config happens to hold, which belongs to the host and can be a DIFFERENT
+      // agent's credential. So a project-level entry wins outright.
+      //
+      // The reverse also matters: a project with NO project-level entry falls
+      // back to the global config — that is the historical behaviour, and it is
+      // how an unwired directory in a wired host still gets its MCP tools. But a
+      // wired project's gate leg comes from ITS OWN declared identity, which is
+      // what makes the opt-in per-session rather than per-host (SPECS/0041).
+      //
+      // opencode merges project and global config (verified: a project
+      // opencode.json `plugin` entry coexists with the global plugin array), so
+      // reading them separately here mirrors what the harness itself resolves.
+      const configs = [
+        `${process.env.PWD}/opencode.jsonc`,
+        `${process.env.PWD}/opencode.json`,
+        `${process.env.HOME}/.config/opencode/opencode.jsonc`,
+        `${process.env.HOME}/.config/opencode/opencode.json`,
+      ]
+      for (const cfg of configs) {
+        if (!(await Bun.file(cfg).exists())) continue
+        const d = JSON.parse(stripJsonc(await Bun.file(cfg).text())) as {
+          mcp?: Record<string, { headers?: Record<string, string> }>
         }
-        return `${process.env.HOME}/.config/opencode/opencode.json`
-      })()
-      const d = JSON.parse(stripJsonc(await Bun.file(cfg).text())) as {
-        mcp?: Record<string, { headers?: Record<string, string> }>
+        const auth = d.mcp?.agentbus?.headers?.Authorization ?? ""
+        const m = auth.match(/^\s*[Bb]earer\s+(\S+)\s*$/)
+        if (m) {
+          // Name WHICH config supplied the credential, so a mis-resolved agent
+          // is diagnosed instead of guessed at. The project path is the one
+          // setup opencode writes, and the name is what tells an operator that
+          // this session is being served by its own declared identity.
+          await mark(`credential from ${cfg}`)
+          return m[1]
+        }
       }
-      const auth = d.mcp?.agentbus?.headers?.Authorization ?? ""
-      const m = auth.match(/^\s*[Bb]earer\s+(\S+)\s*$/)
-      return m ? m[1] : ""
+      return ""
     } catch { return "" }
   }
 
