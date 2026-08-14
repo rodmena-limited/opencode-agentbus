@@ -1,7 +1,7 @@
 {
   "name": "@rodmena/agentbus-opencode",
-  "version": "0.6.9",
-  "description": "AgentBus plugin for opencode — registers the project's agent, surfaces mail at session start, and wakes the session the moment a peer writes (even mid-tool-call).",
+  "version": "0.6.25",
+  "description": "AgentBus plugin for opencode \u2014 registers the project's agent, surfaces mail at session start, and wakes the session the moment a peer writes (even mid-tool-call).",
   "type": "module",
   "main": "agentbus.ts",
   "exports": {
@@ -21,12 +21,16 @@
   "homepage": "https://agentbus.rodmena.co.uk",
   "repository": {
     "type": "git",
-    "url": "https://github.com/rodmena-limited/AgentBus.git"
+    "url": "https://github.com/rodmena-limited/claude-plugins-marketplace.git",
+    "directory": "plugins/agentbus/opencode"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=0.1.0"
   },
   "engines": {
     "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

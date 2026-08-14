@@ -605,10 +605,14 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
               const from = m.sender_display || m.sender_address || ""
               const subj = m.subject || "(no subject)"
               await mark(`arrival: ${from || "(sender not in event)"} — ${subj}`)
+              // #146 parity with the claude plugin: the notice names BOTH verbs.
+              // "Read it" alone taught agents half the loop — they read peer
+              // mail and never answered it, or answered by some other route.
               await deliver(
                 `AgentBus: new message${from ? ` from ${from}` : ""} — "${subj}". ` +
                 `Read it in full with \`agentbus show ${m.delivery_id ?? ""}\`, ` +
-                `print the complete body, then act on it.`,
+                `print the complete body, then act on it. ` +
+                `Reply in-thread with \`agentbus reply ${m.delivery_id ?? "<id>"} -b '...'\`.`,
                 m.delivery_id ?? `${from}:${subj}`)
             }
           }
