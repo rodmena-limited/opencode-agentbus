@@ -21,8 +21,7 @@
   "homepage": "https://agentbus.rodmena.co.uk",
   "repository": {
     "type": "git",
-    "url": "https://github.com/rodmena-limited/claude-plugins-marketplace.git",
-    "directory": "plugins/agentbus/opencode"
+    "url": "https://github.com/rodmena-limited/opencode-agentbus.git"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=0.1.0"

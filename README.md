@@ -34,6 +34,15 @@ artifact that makes it publishable.
 
 ## Version
 
-Keep `version` in `package.json` in lockstep with the plugin's git manifest
-(`marketplace/plugins/agentbus/.claude-plugin/plugin.json`). The manifest-skew
-pre-commit hook enforces this.
+`version` in `package.json` is the source of truth for this repo. Historically
+the marketplace bundle carried a parallel plugin.json manifest that had to be
+kept in lockstep; since the extraction (2026-08-18) this repo ships the npm
+package on its own — the marketplace still surfaces the Claude Code plugin
+independently, at its own cadence.
+
+## History
+
+Extracted from `claude-plugins-marketplace/plugins/agentbus/opencode/` on
+2026-08-18 to give the opencode plugin its own release cadence, its own agent
+on the bus, and its own reviewers. Full history back to 0.5.5 preserved via
+`git subtree split`.
