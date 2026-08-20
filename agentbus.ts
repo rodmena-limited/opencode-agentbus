@@ -78,11 +78,20 @@ async function run(
     // like a permissions decision and is actually a missing key. opencode holds
     // the right key in its own MCP config, so it is passed through here rather
     // than left to the host's global config, which belongs to another agent.
-    const e = env ? { ...process.env, ...env } : undefined
+    //
+    // process.env values are `string | undefined`; BunShell.env wants
+    // Record<string, string>, so undefined entries are dropped (a var set to
+    // undefined is a var not set, and passing it typed makes tsc drift-proof).
+    function hostEnv(extra?: Record<string, string>): Record<string, string> {
+      const e: Record<string, string> = {}
+      for (const [k, v] of Object.entries(process.env)) if (v !== undefined) e[k] = v
+      if (extra) Object.assign(e, extra)
+      return e
+    }
     const base = stdin === undefined
       ? $`${bin} ${args}`
       : $`echo ${stdin} | ${bin} ${args}`
-    const proc = (e ? base.env(e) : base).quiet().nothrow()
+    const proc = (env ? base.env(hostEnv(env)) : base).quiet().nothrow()
     const out = await proc
     return {
       code: out.exitCode ?? 0,
@@ -120,7 +129,17 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   async function mark(line: string): Promise<void> {
     try {
       const prev = await Bun.file(markerPath).text().catch(() => "")
-      await Bun.write(markerPath, prev + line + "\n")
+      // BOUNDED: a long-lived host (days of uptime) must not grow the marker
+      // without limit. Keep the most recent 400 lines so the tail is always
+      // the interesting part, and WARN when history is dropped.
+      const next = prev + line + "\n"
+      const lines = next.split("\n")
+      if (lines.length > 500) {
+        const kept = lines.slice(lines.length - 400)
+        await Bun.write(markerPath, kept.join("\n") + "\n")
+      } else {
+        await Bun.write(markerPath, next)
+      }
     } catch { /* diagnostics only; never break a session for it */ }
   }
   await mark(`loaded ${new Date().toISOString()} `
@@ -163,6 +182,11 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   const WINDOW_MS = 60_000
   let injections: number[] = []
   let mutedUntil = 0
+  // Burst suppression must never DROP a wake: instead of staying silent for the
+  // whole window, count the arrivals and emit ONE coalesced "N messages
+  // waiting" the moment the budget re-opens — a busy agent still learns a burst
+  // happened and where to read it, without being flooded 12 times a minute.
+  let suppressedCount = 0
   // One greeting per PROCESS, for the reason above.
   let greeted = false
   function budgetAllows(now: number): boolean {
@@ -188,6 +212,35 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
    * which is worse than not waking at all. The MCP header is the one credential
    * this session has actually been given, so CLI and MCP agree by construction.
    */
+  /**
+   * The identity a project DECLARES for itself: `.agentbus/agent` at or above
+   * the working directory.
+   *
+   * PARITY WITH THE CLAUDE HOOKS AND agentbus-monitor.sh (#90). Claude resolves
+   * identity as: $AGENTBUS_AGENT, else walk up from $PWD reading
+   * `.agentbus/agent`, else `.claude/settings.local.json`. opencode's server is
+   * not launched from the shell that runs the hooks, so AGENTBUS_AGENT is
+   * routinely ABSENT here while being present for Claude — and the previous
+   * build never looked at `.agentbus/agent`, so a project that opted in that way
+   * silently never started its wake. Discovered identity feeds BOTH the
+   * bound-key store lookup and the fallback agent name, exactly like the hooks.
+   */
+  async function discoverAgentFromProject(): Promise<string> {
+    let d = process.env.PWD || process.cwd() || ""
+    for (;;) {
+      try {
+        const p = `${d}/.agentbus/agent`
+        if (await Bun.file(p).exists()) {
+          const name = (await Bun.file(p).text()).trim()
+          if (name) return name
+        }
+      } catch { /* unreadable — keep walking up, same as the shell hooks */ }
+      const i = d.lastIndexOf("/")
+      if (i <= 0) return ""
+      d = d.slice(0, i)
+    }
+  }
+
   async function resolveKey(): Promise<string> {
     if (process.env.AGENTBUS_API_KEY) return process.env.AGENTBUS_API_KEY
 
@@ -197,12 +250,13 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
     // plugin never looked, so a host with a perfectly good credential on disk
     // still reported "no credential".
     //
-    // ONLY when AGENTBUS_AGENT names the identity. If several key files exist,
+    // ONLY when we know which agent this session is. If several key files exist,
     // picking one would be guessing which agent this session is, and SPECS/0029
     // is explicit that identity is declared and never inferred: a wrong guess
     // makes this session act as, and read the mail of, somebody else. Staying
-    // unidentified is the safe failure.
-    const named = process.env.AGENTBUS_AGENT
+    // unidentified is the safe failure. The declared identity is
+    // $AGENTBUS_AGENT, else the project's own `.agentbus/agent` walk (parity).
+    const named = process.env.AGENTBUS_AGENT || await discoverAgentFromProject()
     if (named) {
       try {
         const p = `${configDir}/keys/${named}.env`
@@ -365,11 +419,29 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
     if (key) {
       if (announced.has(key)) return
       announced.add(key)
+      // BOUNDED: the dedupe set grows one entry per delivery; cap it so a
+      // long-lived host does not leak memory forever. Clearing loses the
+      // dedupe window (a replay re-wakes) — the cheap end of the tradeoff.
+      if (announced.size > 10_000) announced.clear()
     }
     const now = Date.now()
     if (!budgetAllows(now)) {
-      await mark(`SUPPRESSED (injection budget): ${text.slice(0, 80)}`)
+      // Never drop a wake: remember the burst and re-surface it coalesced when
+      // the budget re-opens (the very next arrival after the window flips it).
+      suppressedCount += 1
+      await mark(`burst-suppressed (${suppressedCount} pending): ${text.slice(0, 80)}`)
       return
+    }
+    // A burst was suppressed while muted: surface ONE coalesced wake first, so
+    // the agent learns mail is waiting without being flooded per message.
+    if (suppressedCount > 0) {
+      const n = suppressedCount
+      suppressedCount = 0
+      await mark(`emitting coalesced burst notice (${n} messages)`)
+      await tell(
+        currentSession,
+        `AgentBus: ${n} more messages arrived in the last burst. ` +
+        `Read them with \`agentbus inbox --unread\` and act on each.`)
     }
     if (currentSession) { await tell(currentSession, text); return }
     // No session yet. submitPrompt SENDS the text, so if that succeeds the
@@ -381,7 +453,13 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
     // would recreate the silent inbox one layer up; duplicating it when
     // delivery worked is noise the agent has to reason about.
     const delivered = await tell("", text)
-    if (!delivered) pending.push(text)
+    // Buffer ONLY when the TUI path could not deliver, and never without bound:
+    // a host that cannot render for a long stretch must drop the oldest rather
+    // than let the queue grow forever (the newest arrivals matter most).
+    if (!delivered) {
+      if (pending.length >= 200) pending.shift()
+      pending.push(text)
+    }
   }
 
   /**
@@ -456,7 +534,17 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
     if (watcher) return
     sessionKey = await resolveKey()
     const key = sessionKey
-    agentName = await resolveAgent(key)
+    if (!key) {
+      // A wake without a credential cannot authenticate a single request; the
+      // hooks will still gate on their own resolution, but there is nothing to
+      // listen with. Say WHICH sources were empty rather than silently idling.
+      await mark("wake NOT started: no API key (env, bound-key store, or opencode.json)")
+      return
+    }
+    // The CLI `whoami` names the credential's own agent; the project's
+    // declared `.agentbus/agent` is the fallback (parity with the Claude
+    // hooks) for hosts where AGENTBUS_AGENT is absent from opencode's env.
+    agentName = (await resolveAgent(key)) || await discoverAgentFromProject()
     if (!agentName) {
       await mark("wake NOT started: no identity could be established for this session")
       return
@@ -498,25 +586,82 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       let backoff = 1000
       for (;;) {
         if (ac.signal.aborted) return
-        let live = false          // have we passed the `: connected` marker?
-        try {
-          const headers: Record<string, string> = {
-            Authorization: `Bearer ${key}`,
-            "X-AgentBus-Agent": agentName,
-            Accept: "text/event-stream",
-          }
-          // On a RESUME we do want what was missed, so the cursor is sent and
-          // everything after it counts as live. Only the FIRST connection of a
-          // process discards history.
-          if (lastId) { headers["Last-Event-ID"] = lastId; live = true }
+      let live = false          // have we passed the `: connected` marker?
 
-          const res = await fetch(`${base}/v1/stream`, { headers, signal: ac.signal })
-          if (!res.ok || !res.body) {
-            await mark(`stream connect failed: HTTP ${res.status}`)
-            throw new Error(`HTTP ${res.status}`)
+      /**
+       * Second opinion before this client ever gives up for good: is the
+       * credential actually revoked/rejected by REST, or was the stream's 401
+       * a server-side blip? Only 401/403 from whoami counts as a verdict; a
+       * timeout / 5xx / connection error answers "could not tell", and
+       * could-not-tell must never stop the wake.
+       */
+      async function keyReallyRevoked(): Promise<boolean> {
+        try {
+          const r = await fetch(`${base}/v1/whoami`, {
+            headers: { Authorization: `Bearer ${key}`, "X-AgentBus-Agent": agentName },
+            signal: AbortSignal.timeout(15_000),
+          })
+          return r.status === 401 || r.status === 403
+        } catch { return false }
+      }
+
+      try {
+        const headers: Record<string, string> = {
+          Authorization: `Bearer ${key}`,
+          "X-AgentBus-Agent": agentName,
+          Accept: "text/event-stream",
+          // PARITY WITH THE PYTHON WATCHER: tells the server this is a wake
+          // channel (not a recorder), so reachability reports a waker and the
+          // plugin's subscription counts as one.
+          "X-AgentBus-Wake-Capable": "1",
+        }
+        // On a RESUME we do want what was missed, so the cursor is sent and
+        // everything after it counts as live. Only the FIRST connection of a
+        // process discards history.
+        if (lastId) { headers["Last-Event-ID"] = lastId; live = true }
+
+        // CONNECT DEADLINE — the idle deadline below only wraps reader.read(),
+        // which never runs if the fetch itself pends. A blackholed network (a
+        // catastrophic drop where the SYN goes nowhere) used to hang here
+        // forever: no backoff, no reconnect, a wake that looks alive and hears
+        // nothing. 20s bound on the CONNECT, then backoff and retry.
+        //
+        // NOT AbortSignal.any([ac.signal, AbortSignal.timeout(...)]): that
+        // composition stays armed AFTER the fetch resolves and aborts the body
+        // ~20s into every connection — a reconnect-every-20s loop that starved
+        // wakes through the injection budget (measured against the live bus).
+        // Instead a per-attempt controller is aborted by BOTH a timer (cleared
+        // the moment the connect succeeds) and the plugin's own dispose signal,
+        // so after connect only dispose can end the stream.
+        const conn = new AbortController()
+        const onDispose = () => conn.abort()
+        ac.signal.addEventListener("abort", onDispose, { once: true })
+        const connectTimer = setTimeout(() => conn.abort(), 20_000)
+        let res: Response
+        try {
+          res = await fetch(`${base}/v1/stream`, { headers, signal: conn.signal })
+        } finally {
+          // Connect phase over (success or failure): the connect bound must not
+          // linger and kill the body mid-stream. Dispose (onDispose) still can.
+          clearTimeout(connectTimer)
+        }
+        if (!res.ok || !res.body) {
+          ac.signal.removeEventListener("abort", onDispose)
+          await mark(`stream connect failed: HTTP ${res.status}`)
+          if ((res.status === 401 || res.status === 403) && await keyReallyRevoked()) {
+            // A CONFIRMED revoked/rejected credential is TERMINAL. Retrying
+            // would hammer the bus with a key that will never work — the same
+            // asymmetry as the reset audit finding in the Python watcher. Stop
+            // the whole wake loop on REST's word, not the stream's.
+            await mark(
+              "stream: credential confirmed REVOKED or REJECTED by REST — " +
+              "stopping the wake permanently (re-auth is an operator act)")
+            return
           }
-          await mark(`stream connected as ${agentName}${lastId ? ` (resume ${lastId})` : " (live only)"}`)
-          backoff = 1000
+          throw new Error(`HTTP ${res.status}`)
+        }
+        await mark(`stream connected as ${agentName}${lastId ? ` (resume ${lastId})` : " (live only)"}`)
+        backoff = 1000
 
           const reader = res.body.getReader()
           const decoder = new TextDecoder()
@@ -621,8 +766,12 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
           if (ac.signal.aborted) return
           await mark(`stream error: ${String(e).slice(0, 200)}`)
         }
-        await new Promise((r) => setTimeout(r, backoff))
+        // JITTERED BACKOFF, same shape as the Python watcher (+/-15%): N
+        // plugins on N hosts must never reconnect a shared bus in lockstep
+        // after a restart. Caps at 30s so a long outage sleeps, not spins.
+        const delay = backoff * (0.85 + Math.random() * 0.3)
         backoff = Math.min(backoff * 2, 30_000)
+        await new Promise((r) => setTimeout(r, delay))
       }
     })()
   }
