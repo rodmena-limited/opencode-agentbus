@@ -29,6 +29,25 @@ const CLI_BIN = process.env.AGENTBUS_BIN || "agentbus"
 type HookResult = { code: number; stdout: string; stderr: string }
 
 /**
+ * Bound a shell-out by wall-clock time. BunShell has no `.timeout()`, and an
+ * unbounded `$` can hang the whole plugin — a blackholed network made the
+ * load-time whoami pend for the SDK's full retry budget, which BLOCKED
+ * opencode's startup (measured: only the `loaded` marker, process killed by
+ * the outer timeout). A bounded race returns a 127 (undecidable) result after
+ * `ms`; the orphaned child is left for the OS to reap, which is the cheaper
+ * side of the tradeoff.
+ */
+async function bounded(what: string, ms: number, p: Promise<HookResult>): Promise<HookResult> {
+  let t: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<HookResult>((resolve) => {
+    t = setTimeout(() => resolve({ code: 127, stdout: "", stderr: `timed out after ${ms}ms (${what})` }), ms)
+  })
+  const out = await Promise.race([p, timeout])
+  if (t) clearTimeout(t)
+  return out
+}
+
+/**
  * Run the shared client. NEVER throws — a messaging plugin that breaks the
  * session it is attached to is worse than one that stays quiet. The ONE
  * exception is the gate, which converts failure into a DENY at its call site,
@@ -92,12 +111,15 @@ async function run(
       ? $`${bin} ${args}`
       : $`echo ${stdin} | ${bin} ${args}`
     const proc = (env ? base.env(hostEnv(env)) : base).quiet().nothrow()
-    const out = await proc
-    return {
+    // THE GATE AND THE WAKE MUST NEVER HANG THE SESSION: the hooks shell out
+    // on every tool call / turn, so an unresponsive `agentbus` (network hang,
+    // wedged client) would stall the agent indefinitely. 5s is a generous
+    // budget for a local CLI and a firm bound on a hang.
+    return await bounded(`${bin} ${args}`, 5_000, proc.then((out) => ({
       code: out.exitCode ?? 0,
       stdout: out.stdout?.toString() ?? "",
       stderr: out.stderr?.toString() ?? "",
-    }
+    })))
   } catch (err) {
     // Absent or unrunnable binary: report non-zero so the gate treats it as
     // undecidable rather than as permission.
@@ -347,13 +369,18 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   /** Run the CLI with an explicit credential rather than the host default. */
   async function runWithKey(args: string[], key: string): Promise<HookResult> {
     try {
-      const out = await $`${CLI_BIN} ${args}`.env({ ...process.env, AGENTBUS_API_KEY: key })
-        .quiet().nothrow()
-      return {
-        code: out.exitCode ?? 0,
-        stdout: out.stdout?.toString() ?? "",
-        stderr: out.stderr?.toString() ?? "",
-      }
+      const out = await bounded(
+        `agentbus ${args.join(" ")}`,
+        5_000,
+        $`${CLI_BIN} ${args}`.env({ ...process.env, AGENTBUS_API_KEY: key })
+          .quiet().nothrow()
+          .then((o) => ({
+            code: o.exitCode ?? 0,
+            stdout: o.stdout?.toString() ?? "",
+            stderr: o.stderr?.toString() ?? "",
+          })),
+      )
+      return out
     } catch (err) {
       return { code: 127, stdout: "", stderr: String(err) }
     }
@@ -541,10 +568,13 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       await mark("wake NOT started: no API key (env, bound-key store, or opencode.json)")
       return
     }
-    // The CLI `whoami` names the credential's own agent; the project's
-    // declared `.agentbus/agent` is the fallback (parity with the Claude
-    // hooks) for hosts where AGENTBUS_AGENT is absent from opencode's env.
-    agentName = (await resolveAgent(key)) || await discoverAgentFromProject()
+    // The CLI `whoami` names the credential's own agent; offline (bus down at
+    // startup) it cannot, so the DECLARED identities are the fallback in order:
+    // $AGENTBUS_AGENT, then the project's own `.agentbus/agent` (parity with
+    // the Claude hooks). Identity is declared, never inferred — the env var is
+    // the strongest declaration there is, and a watcher MUST be able to start
+    // with the bus down and sit in backoff until it returns.
+    agentName = (await resolveAgent(key)) || process.env.AGENTBUS_AGENT || await discoverAgentFromProject()
     if (!agentName) {
       await mark("wake NOT started: no identity could be established for this session")
       return
