@@ -1,0 +1,60 @@
+# Publish @rodmena/agentbus-opencode to npm with PROVENANCE via OIDC trusted
+# publishing — no long-lived token in CI.
+#
+# ONE-TIME SETUP (operator, on npmjs.com — the only manual step):
+#   npmjs.com -> @rodmena/agentbus-opencode -> Access -> Trusted publishers ->
+#   add: GitHub Actions, repository rodmena-limited/opencode-agentbus,
+#   workflow publish.yml, environment (leave empty).
+# Until that click exists, this workflow fails at `npm publish` with
+# E404/EOTP — by design: there is no token fallback here, because a fallback
+# secret would quietly become the real mechanism (the same posture as the
+# original marketplace workflow, now living in the plugin's own repo since
+# the extraction 2026-08-18).
+#
+# Trigger: push a tag `opencode-vX.Y.Z` matching the package.json version.
+name: publish-opencode
+
+on:
+  push:
+    tags:
+      - "opencode-v*"
+
+permissions:
+  contents: read
+  id-token: write # OIDC — this IS the credential
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: install with the committed lockfile
+        run: bun install --frozen-lockfile
+      - name: typecheck gate
+        run: bun x tsc --noEmit
+      - name: tag must match package.json version
+        run: |
+          pkg="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME#opencode-v}"
+          if [ "$pkg" != "$tag" ]; then
+            echo "tag $tag != package.json $pkg — refusing to publish a mismatch"
+            exit 1
+          fi
+      - name: publish with provenance
+        run: npm publish --provenance --access public
+      - name: verify the SERVED artifact, not the exit code
+        run: |
+          sleep 20
+          served="$(npm view @rodmena/agentbus-opencode@"${GITHUB_REF_NAME#opencode-v}" version 2>/dev/null || true)"
+          if [ "$served" != "${GITHUB_REF_NAME#opencode-v}" ]; then
+            echo "registry does not serve ${GITHUB_REF_NAME#opencode-v} yet (got '$served')"
+            exit 1
+          fi
+          echo "registry serves $served"
